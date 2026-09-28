@@ -322,3 +322,4 @@ window.addEventListener('keydown', (e) => {
   }
   for (const [id, s] of Object.entries(SPELLS)) if (e.key === s.key) triggerSpell(id, 'key');
 });
+
