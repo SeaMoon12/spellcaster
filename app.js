@@ -1,5 +1,5 @@
 // Wizarding World Spellcaster - Phase 2B: camera + MediaPipe hand tracking.
-// Section 2C adds voice recognition and spell triggering.
+// 2C: voice recognition and spell triggering. 3A: drawing trail and size measurement.
 
 import { HandLandmarker, FilesetResolver } from
   'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/+esm';
@@ -63,6 +63,103 @@ async function requestMic() {
   } catch (err) {
     setStatus('st-mic', 'bad', `Microphone: ${err.name}`);
   }
+}
+
+// ---------- Drawing trail (Phase 3A) ----------
+// The fingertip path of the last few seconds is always kept and fades out. When a
+// spell is cast, its size (bounding box of the drawing) decides how big the spell is.
+const TRAIL_LIFETIME_MS = 3000;   // how long a drawing stays alive
+const TRAIL_MIN_STEP_PX = 4;      // ignore jitter smaller than this
+const MIN_POINTS_FOR_DRAWING = 8; // fewer points than this = no real drawing
+const SIZE_MIN_NORM = 0.10;       // drawing diagonal / screen short side -> smallest spell
+const SIZE_MAX_NORM = 0.80;       // ... -> biggest spell
+const SCALE_MIN = 0.5, SCALE_MAX = 2.5;
+
+let trail = [];                   // { x, y, t, brk } brk = starts a new stroke
+let trailBreak = true;
+let showTrailBox = false;
+let trailStatusAt = 0;
+
+function updateTrail(now) {
+  while (trail.length && now - trail[0].t > TRAIL_LIFETIME_MS) trail.shift();
+  if (!hand.visible) {
+    trailBreak = true;            // don't connect across a lost-hand gap
+  } else {
+    const last = trail[trail.length - 1];
+    if (!last || trailBreak || Math.hypot(hand.x - last.x, hand.y - last.y) >= TRAIL_MIN_STEP_PX) {
+      trail.push({ x: hand.x, y: hand.y, t: now, brk: trailBreak });
+      trailBreak = false;
+    }
+  }
+  if (now - trailStatusAt > 200) {
+    trailStatusAt = now;
+    const s = getTrailSnapshot();
+    setStatus('st-trail', s.hasDrawing ? 'ok' : 'wait',
+      s.hasDrawing ? `Drawing: size x${s.scale.toFixed(2)}` : 'Drawing: none');
+  }
+}
+
+// Everything the spell effects need to know about the current drawing.
+function getTrailSnapshot() {
+  const now = performance.now();
+  const pts = trail.filter(p => now - p.t <= TRAIL_LIFETIME_MS);
+  if (pts.length < MIN_POINTS_FOR_DRAWING) {
+    return {
+      hasDrawing: false, scale: 1, diag: 0, points: [], bbox: null,
+      center: hand.visible ? { x: hand.x, y: hand.y } : { x: fx.width / 2, y: fx.height / 2 }
+    };
+  }
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const p of pts) {
+    minX = Math.min(minX, p.x); maxX = Math.max(maxX, p.x);
+    minY = Math.min(minY, p.y); maxY = Math.max(maxY, p.y);
+  }
+  const diag = Math.hypot(maxX - minX, maxY - minY);
+  const norm = diag / Math.min(fx.width, fx.height);
+  const t = Math.min(1, Math.max(0, (norm - SIZE_MIN_NORM) / (SIZE_MAX_NORM - SIZE_MIN_NORM)));
+  return {
+    hasDrawing: true,
+    scale: SCALE_MIN + (SCALE_MAX - SCALE_MIN) * t,
+    diag,
+    bbox: { minX, minY, maxX, maxY },
+    center: { x: (minX + maxX) / 2, y: (minY + maxY) / 2 },
+    points: pts.map(p => ({ x: p.x, y: p.y, t: p.t, brk: p.brk }))
+  };
+}
+window.getTrailSnapshot = getTrailSnapshot;
+
+function drawTrail() {
+  const now = performance.now();
+  const on = activeSpell && now < activeSpell.until;
+  const [r, g, b] = on ? activeSpell.color : [190, 160, 255];
+  ctx.save();
+  ctx.globalCompositeOperation = 'lighter';
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  for (let i = 1; i < trail.length; i++) {
+    const p = trail[i], q = trail[i - 1];
+    if (p.brk) continue;
+    const life = 1 - (now - p.t) / TRAIL_LIFETIME_MS;
+    if (life <= 0) continue;
+    const a = life * life;
+    ctx.beginPath(); ctx.moveTo(q.x, q.y); ctx.lineTo(p.x, p.y);
+    ctx.strokeStyle = `rgba(${r},${g},${b},${0.25 * a})`;
+    ctx.lineWidth = 16 * life + 4;
+    ctx.stroke();
+    ctx.strokeStyle = `rgba(255,255,255,${0.9 * a})`;
+    ctx.lineWidth = 3 * life + 1;
+    ctx.stroke();
+  }
+  if (showTrailBox) {
+    const s = getTrailSnapshot();
+    if (s.hasDrawing) {
+      ctx.setLineDash([8, 6]);
+      ctx.strokeStyle = 'rgba(120,255,160,.8)';
+      ctx.lineWidth = 2;
+      ctx.strokeRect(s.bbox.minX, s.bbox.minY, s.bbox.maxX - s.bbox.minX, s.bbox.maxY - s.bbox.minY);
+    }
+  }
+  ctx.restore();
 }
 
 // ---------- Hand tracking ----------
@@ -155,6 +252,7 @@ function loop() {
   }
   if (hand.visible && now - hand.lastSeen > LOST_AFTER_MS) hand.visible = false;
 
+  updateTrail(now);
   draw();
 }
 
@@ -166,6 +264,7 @@ function draw() {
       ctx.beginPath(); ctx.arc(p.x, p.y, 4, 0, Math.PI * 2); ctx.fill();
     }
   }
+  drawTrail();
   if (hand.visible) {
     // Test glow at the emission point (replaced by spell particles in Phase 3/4).
     const g = ctx.createRadialGradient(hand.x, hand.y, 0, hand.x, hand.y, 40);
@@ -226,13 +325,14 @@ function triggerSpell(id, source) {
   const s = SPELLS[id];
   if (!s) return false;
   lastSpellAt = now;
+  const trailSnap = getTrailSnapshot();   // the drawing at the moment of casting
   activeSpell = { id, color: s.color, until: now + SPELL_DURATION_MS };
   const banner = document.getElementById('banner');
-  banner.textContent = s.name;
+  banner.textContent = trailSnap.hasDrawing ? `${s.name}  x${trailSnap.scale.toFixed(1)}` : s.name;
   banner.classList.add('show');
   setTimeout(() => banner.classList.remove('show'), 1800);
-  console.log(`Spell cast: ${s.name} (via ${source})`);
-  window.dispatchEvent(new CustomEvent('spell', { detail: { id, name: s.name, source } }));
+  console.log(`Spell cast: ${s.name} (via ${source}), size x${trailSnap.scale.toFixed(2)}`);
+  window.dispatchEvent(new CustomEvent('spell', { detail: { id, name: s.name, source, trail: trailSnap } }));
   return true;
 }
 window.triggerSpell = triggerSpell;
@@ -316,10 +416,11 @@ window.addEventListener('keydown', (e) => {
   const k = e.key.toLowerCase();
   if (k === 'd') statusPanel.classList.toggle('hidden');
   if (k === 'l') showAllLandmarks = !showAllLandmarks;
+  if (k === 'b') showTrailBox = !showTrailBox;
+  if (k === 'c') trail = [];
   if (k === 'f') {
     if (!document.fullscreenElement) document.documentElement.requestFullscreen();
     else document.exitFullscreen();
   }
   for (const [id, s] of Object.entries(SPELLS)) if (e.key === s.key) triggerSpell(id, 'key');
 });
-
