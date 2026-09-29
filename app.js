@@ -1,8 +1,10 @@
 // Wizarding World Spellcaster - Phase 2B: camera + MediaPipe hand tracking.
-// 2C: voice recognition and spell triggering. 3A: drawing trail and size measurement.
+// 2C: voice recognition and spell triggering. 3A: drawing trail and size measurement. 3B: particle engine.
 
 import { HandLandmarker, FilesetResolver } from
   'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/+esm';
+
+import { ParticleSystem, burst, emitAlongPath } from './particles.js';
 
 const WASM_URL = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm';
 const MODEL_URL = 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task';
@@ -20,6 +22,11 @@ const LOST_AFTER_MS = 250;    // hide the dot if the hand vanishes this long
 export const hand = { visible: false, x: 0, y: 0, lastSeen: 0 };
 window.hand = hand;
 
+const particles = new ParticleSystem(4000);
+window.particles = particles;
+let stress = false;          // S key: heavy emission to test performance
+let lastFrameAt = performance.now();
+let renderFrames = 0, renderStamp = performance.now();
 let showAllLandmarks = false;
 let activeSpell = null;      // { id, color, until }
 
@@ -253,7 +260,22 @@ function loop() {
   if (hand.visible && now - hand.lastSeen > LOST_AFTER_MS) hand.visible = false;
 
   updateTrail(now);
+
+  const dt = (now - lastFrameAt) / 1000;
+  lastFrameAt = now;
+  if (stress && hand.visible) {
+    burst(particles, hand.x, hand.y, 40, { speed: 160, life: 1.5, size: 8, color: [190, 160, 255], colorEnd: [80, 120, 255] });
+  }
+  particles.update(dt);
   draw();
+
+  renderFrames++;
+  if (now - renderStamp >= 500) {
+    const rfps = Math.round(renderFrames * 1000 / (now - renderStamp));
+    setStatus('st-particles', rfps >= 40 ? 'ok' : rfps >= 25 ? 'wait' : 'bad',
+      `Particles: ${particles.count}/${particles.max} at ${rfps} fps`);
+    renderFrames = 0; renderStamp = now;
+  }
 }
 
 function draw() {
@@ -265,6 +287,7 @@ function draw() {
     }
   }
   drawTrail();
+  particles.draw(ctx);
   if (hand.visible) {
     // Test glow at the emission point (replaced by spell particles in Phase 3/4).
     const g = ctx.createRadialGradient(hand.x, hand.y, 0, hand.x, hand.y, 40);
@@ -398,6 +421,20 @@ for (const [id, s] of Object.entries(SPELLS)) {
   btnBox.appendChild(b);
 }
 
+// ---------- Generic test effect (replaced by the real spell effects in 3C) ----------
+window.addEventListener('spell', (e) => {
+  const { id, trail: tr } = e.detail;
+  const col = SPELLS[id].color;
+  const opts = { color: col, colorEnd: [col[0] * 0.4, col[1] * 0.4, col[2] * 0.4], scale: tr.scale };
+  burst(particles, tr.center.x, tr.center.y, 90, { ...opts, speed: 260, life: 1.2, size: 10 });
+  if (tr.hasDrawing) {
+    // Stream particles along the drawn path for a moment (Decision 3B).
+    particles.addEffect((t, dt, ps) => {
+      emitAlongPath(ps, tr.points, 220 * dt, { ...opts, life: 1.0, size: 8, jitter: 8, speed: 60, ay: -30 });
+    }, 1.5);
+  }
+});
+
 document.getElementById('start-btn').addEventListener('click', async () => {
   document.getElementById('start').style.display = 'none';
   try { await startCamera(); } catch (e) { console.error(e); return; }
@@ -417,7 +454,8 @@ window.addEventListener('keydown', (e) => {
   if (k === 'd') statusPanel.classList.toggle('hidden');
   if (k === 'l') showAllLandmarks = !showAllLandmarks;
   if (k === 'b') showTrailBox = !showTrailBox;
-  if (k === 'c') trail = [];
+  if (k === 'c') { trail = []; particles.clear(); }
+  if (k === 's') stress = !stress;
   if (k === 'f') {
     if (!document.fullscreenElement) document.documentElement.requestFullscreen();
     else document.exitFullscreen();
