@@ -1,10 +1,11 @@
 // Wizarding World Spellcaster - Phase 2B: camera + MediaPipe hand tracking.
-// 2C: voice recognition and spell triggering. 3A: drawing trail and size measurement. 3B: particle engine.
+// 2C: voice recognition and spell triggering. 3A: drawing trail and size measurement. 3B: particle engine. 3C: the three spell effects.
 
 import { HandLandmarker, FilesetResolver } from
   'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/+esm';
 
 import { ParticleSystem, burst, emitAlongPath } from './particles.js';
+import { castPatronus, castLumos, castIncendio } from './spells.js';
 
 const WASM_URL = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm';
 const MODEL_URL = 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task';
@@ -24,6 +25,11 @@ window.hand = hand;
 
 const particles = new ParticleSystem(4000);
 window.particles = particles;
+
+// Adaptive quality (Phase 3C): if rendering falls behind, new effects spawn fewer
+// particles. This does not change already-running effects, only future spawns.
+let qualityScale = 1;
+window.getQualityScale = () => qualityScale;
 let stress = false;          // S key: heavy emission to test performance
 let lastFrameAt = performance.now();
 let renderFrames = 0, renderStamp = performance.now();
@@ -260,6 +266,7 @@ function loop() {
   if (hand.visible && now - hand.lastSeen > LOST_AFTER_MS) hand.visible = false;
 
   updateTrail(now);
+  dementorTick(now);
 
   const dt = (now - lastFrameAt) / 1000;
   lastFrameAt = now;
@@ -272,8 +279,11 @@ function loop() {
   renderFrames++;
   if (now - renderStamp >= 500) {
     const rfps = Math.round(renderFrames * 1000 / (now - renderStamp));
-    setStatus('st-particles', rfps >= 40 ? 'ok' : rfps >= 25 ? 'wait' : 'bad',
-      `Particles: ${particles.count}/${particles.max} at ${rfps} fps`);
+    // Ease the quality target toward what the fps can sustain, in 25% steps.
+    const target = rfps >= 35 ? 1 : rfps >= 22 ? 0.6 : 0.35;
+    qualityScale += (target - qualityScale) * 0.3;
+    setStatus('st-particles', rfps >= 35 ? 'ok' : rfps >= 22 ? 'wait' : 'bad',
+      `Particles: ${particles.count}/${particles.max} at ${rfps} fps (quality ${Math.round(qualityScale * 100)}%)`);
     renderFrames = 0; renderStamp = now;
   }
 }
@@ -288,16 +298,10 @@ function draw() {
   }
   drawTrail();
   particles.draw(ctx);
-  if (hand.visible) {
-    // Test glow at the emission point (replaced by spell particles in Phase 3/4).
-    const g = ctx.createRadialGradient(hand.x, hand.y, 0, hand.x, hand.y, 40);
-    const on = activeSpell && performance.now() < activeSpell.until;
-    const [r, gr, b] = on ? activeSpell.color : [190, 160, 255];
-    g.addColorStop(0, 'rgba(255,255,255,1)');
-    g.addColorStop(0.3, `rgba(${r},${gr},${b},.8)`);
-    g.addColorStop(1, `rgba(${r},${gr},${b},0)`);
-    ctx.fillStyle = g;
-    ctx.beginPath(); ctx.arc(hand.x, hand.y, 40, 0, Math.PI * 2); ctx.fill();
+  if (hand.visible && showAllLandmarks) {
+    // Small marker at the emission point, only shown alongside the landmark debug view.
+    ctx.fillStyle = 'rgba(255,255,255,.9)';
+    ctx.beginPath(); ctx.arc(hand.x, hand.y, 4, 0, Math.PI * 2); ctx.fill();
   }
 }
 
@@ -421,18 +425,101 @@ for (const [id, s] of Object.entries(SPELLS)) {
   btnBox.appendChild(b);
 }
 
-// ---------- Generic test effect (replaced by the real spell effects in 3C) ----------
+// ---------- Real spell effects (Phase 3C) ----------
+const CASTERS = { patronum: castPatronus, lumos: castLumos, incendio: castIncendio };
 window.addEventListener('spell', (e) => {
   const { id, trail: tr } = e.detail;
-  const col = SPELLS[id].color;
-  const opts = { color: col, colorEnd: [col[0] * 0.4, col[1] * 0.4, col[2] * 0.4], scale: tr.scale };
-  burst(particles, tr.center.x, tr.center.y, 90, { ...opts, speed: 260, life: 1.2, size: 10 });
-  if (tr.hasDrawing) {
-    // Stream particles along the drawn path for a moment (Decision 3B).
-    particles.addEffect((t, dt, ps) => {
-      emitAlongPath(ps, tr.points, 220 * dt, { ...opts, life: 1.0, size: 8, jitter: 8, speed: 60, ay: -30 });
-    }, 1.5);
+  const caster = CASTERS[id];
+  if (!caster) return;
+  // Adaptive quality (from the fps watchdog) shrinks new effects, without touching
+  // effects already in flight, so a frame-rate dip doesn't retroactively resize them.
+  const scaledTrail = { ...tr, scale: tr.scale * qualityScale };
+  caster(particles, scaledTrail, { getHandPos: () => (hand.visible ? { x: hand.x, y: hand.y } : tr.center) });
+});
+
+// ---------- Dementor challenge (Phase 3C) ----------
+// idle -> waiting (random delay) -> active (vignette closes in, must cast patronum) -> resolved
+const DEMENTOR_MIN_DELAY_MS = 10000;
+const DEMENTOR_MAX_DELAY_MS = 25000;
+const DEMENTOR_RESPONSE_MS = 4000;
+
+const dementorEl = document.getElementById('dementor');
+const dementorTimerEl = document.getElementById('dementor-timer');
+const jumpscareEl = document.getElementById('jumpscare');
+const jumpscareVideo = document.getElementById('jumpscare-video');
+const jumpscareFallback = document.getElementById('jumpscare-fallback');
+
+let dementorState = 'idle';   // idle | waiting | active | resolved
+let dementorAt = 0;
+let dementorDeadline = 0;
+
+function scheduleDementor() {
+  dementorState = 'waiting';
+  const delay = DEMENTOR_MIN_DELAY_MS + Math.random() * (DEMENTOR_MAX_DELAY_MS - DEMENTOR_MIN_DELAY_MS);
+  dementorAt = performance.now() + delay;
+}
+
+function dementorTick(now) {
+  if (dementorState === 'waiting' && now >= dementorAt) {
+    dementorState = 'active';
+    dementorDeadline = now + DEMENTOR_RESPONSE_MS;
+    dementorEl.style.background = 'radial-gradient(circle at center, rgba(0,0,0,.15) 0%, rgba(0,0,0,.96) 78%)';
+    dementorEl.style.opacity = '1';
   }
+  if (dementorState === 'active') {
+    const remaining = Math.max(0, dementorDeadline - now);
+    dementorTimerEl.textContent = (remaining / 1000).toFixed(1) + 's';
+    if (remaining <= 0) dementorFail();
+  }
+}
+
+function dementorClear() {
+  dementorEl.style.opacity = '0';
+  dementorState = 'resolved';
+  setTimeout(scheduleDementor, 1500);
+}
+
+function dementorFail() {
+  if (dementorState !== 'active') return;
+  dementorState = 'resolved';
+  dementorEl.style.opacity = '0';
+  playJumpscareThenReset();
+}
+
+// Swap in a real clip by placing jumpscare.mp4 next to index.html; until then this
+// falls back to a quick red/black flash so the mechanic works with no asset.
+function playJumpscareThenReset() {
+  jumpscareEl.style.display = 'flex';
+  let usedVideo = false;
+  jumpscareVideo.src = 'jumpscare.mp4';
+  jumpscareVideo.currentTime = 0;
+  jumpscareVideo.style.display = 'block';
+  jumpscareFallback.style.display = 'none';
+  const toReset = () => { jumpscareEl.style.display = 'none'; resetToStart(); };
+  jumpscareVideo.play().then(() => { usedVideo = true; }).catch(() => {});
+  jumpscareVideo.onended = toReset;
+  setTimeout(() => {
+    if (!usedVideo) {
+      jumpscareVideo.style.display = 'none';
+      jumpscareFallback.style.display = 'block';
+      setTimeout(toReset, 900);
+    }
+  }, 400);
+}
+
+function resetToStart() {
+  wantListening = false;
+  if (recognition) { try { recognition.stop(); } catch (_) {} }
+  dementorState = 'idle';
+  dementorEl.style.opacity = '0';
+  trail = []; particles.clear();
+  document.getElementById('start').style.display = 'flex';
+}
+document.getElementById('back-btn').addEventListener('click', resetToStart);
+
+// Casting Patronum while the dementor is active clears it, regardless of drawing size.
+window.addEventListener('spell', (e) => {
+  if (e.detail.id === 'patronum' && dementorState === 'active') dementorClear();
 });
 
 document.getElementById('start-btn').addEventListener('click', async () => {
@@ -440,6 +527,7 @@ document.getElementById('start-btn').addEventListener('click', async () => {
   try { await startCamera(); } catch (e) { console.error(e); return; }
   await requestMic();
   startSpeech();
+  scheduleDementor();
   try {
     await initHandTracking();
     loop();

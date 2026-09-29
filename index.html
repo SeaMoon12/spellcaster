@@ -43,6 +43,9 @@
     <canvas id="fx"></canvas>
   </div>
 
+  <button id="back-btn" title="Back to start" style="position:fixed;top:10px;right:10px;z-index:9;
+    width:40px;height:40px;border-radius:50%;font-size:18px;padding:0;">&#8592;</button>
+
   <div id="status">
     <div id="st-cam" class="wait">Camera: not started</div>
     <div id="st-mic" class="wait">Microphone: not started</div>
@@ -57,6 +60,24 @@
   </div>
 
   <div id="banner"></div>
+
+  <div id="dementor" style="position:fixed;inset:0;z-index:7;pointer-events:none;
+      background:radial-gradient(circle at center, rgba(0,0,0,0) 0%, rgba(0,0,0,0) 100%);
+      display:flex;align-items:center;justify-content:center;opacity:0;transition:opacity .4s;">
+    <div style="text-align:center;text-shadow:0 0 20px #000;">
+      <div style="font-size:clamp(24px,5vw,44px);letter-spacing:2px;">A dementor approaches...</div>
+      <div style="font-size:clamp(18px,3.5vw,28px);opacity:.9;margin-top:6px;">Cast Expecto Patronum!</div>
+      <div id="dementor-timer" style="font-size:clamp(40px,8vw,72px);font-weight:bold;margin-top:8px;"></div>
+    </div>
+  </div>
+
+  <div id="jumpscare" style="position:fixed;inset:0;z-index:20;background:#000;display:none;
+      align-items:center;justify-content:center;">
+    <video id="jumpscare-video" style="width:100%;height:100%;object-fit:cover;display:none" playsinline></video>
+    <div id="jumpscare-fallback" style="display:none;width:100%;height:100%;background:#900;
+        animation:jf .12s steps(2) 6;"></div>
+  </div>
+  <style>@keyframes jf { from{background:#900} to{background:#000} }</style>
 
   <div id="start">
     <h1>The Wizarding World Spellcaster</h1>
