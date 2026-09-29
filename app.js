@@ -1,4 +1,5 @@
 // Wizarding World Spellcaster - Phase 2B: camera + MediaPipe hand tracking.
+// Phase 3 fixes: Back->Begin safety (single loop/recognizer/camera), dementor timer, jumpscare finish-once.
 // 2C: voice recognition and spell triggering. 3A: drawing trail and size measurement. 3B: particle engine. 3C: the three spell effects.
 
 import { HandLandmarker, FilesetResolver } from
@@ -55,11 +56,13 @@ else setStatus('st-speech', 'bad', 'Speech API: not supported (use Google Chrome
 
 async function startCamera() {
   try {
-    const stream = await navigator.mediaDevices.getUserMedia({
-      video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: 'user' },
-      audio: false
-    });
-    video.srcObject = stream;
+    const existing = video.srcObject;
+    if (!(existing && existing.active)) {          // reuse the stream after Back -> Begin
+      video.srcObject = await navigator.mediaDevices.getUserMedia({
+        video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: 'user' },
+        audio: false
+      });
+    }
     await video.play();
     setStatus('st-cam', 'ok', `Camera: on (${video.videoWidth}x${video.videoHeight})`);
   } catch (err) {
@@ -235,6 +238,7 @@ function toCanvas(lm) {
   };
 }
 
+let loopStarted = false;         // guards against a second requestAnimationFrame loop after Back -> Begin
 let lastVideoTime = -1;
 let frames = 0, fpsStamp = performance.now();
 
@@ -374,6 +378,10 @@ if (navigator.brave && navigator.brave.isBrave) navigator.brave.isBrave().then(v
 function startSpeech() {
   if (!SpeechRecognitionCtor) { setStatus('st-speech-live', 'bad', 'Voice: unsupported, use keys 1/2/3'); return; }
   wantListening = true;
+  if (recognition) {                              // Back -> Begin: retire the old recognizer first
+    recognition.onend = null; recognition.onresult = null; recognition.onerror = null;
+    try { recognition.abort(); } catch (_) {}
+  }
   recognition = new SpeechRecognitionCtor();
   recognition.lang = SPEECH_LANG;
   recognition.continuous = true;
@@ -453,7 +461,9 @@ let dementorState = 'idle';   // idle | waiting | active | resolved
 let dementorAt = 0;
 let dementorDeadline = 0;
 
+let dementorTimer = null;
 function scheduleDementor() {
+  clearTimeout(dementorTimer);
   dementorState = 'waiting';
   const delay = DEMENTOR_MIN_DELAY_MS + Math.random() * (DEMENTOR_MAX_DELAY_MS - DEMENTOR_MIN_DELAY_MS);
   dementorAt = performance.now() + delay;
@@ -476,7 +486,7 @@ function dementorTick(now) {
 function dementorClear() {
   dementorEl.style.opacity = '0';
   dementorState = 'resolved';
-  setTimeout(scheduleDementor, 1500);
+  dementorTimer = setTimeout(scheduleDementor, 1500);
 }
 
 function dementorFail() {
@@ -490,16 +500,25 @@ function dementorFail() {
 // falls back to a quick red/black flash so the mechanic works with no asset.
 function playJumpscareThenReset() {
   jumpscareEl.style.display = 'flex';
-  let usedVideo = false;
+  let usedVideo = false, finished = false;
   jumpscareVideo.src = 'jumpscare.mp4';
   jumpscareVideo.currentTime = 0;
   jumpscareVideo.style.display = 'block';
   jumpscareFallback.style.display = 'none';
-  const toReset = () => { jumpscareEl.style.display = 'none'; resetToStart(); };
+  const toReset = () => {
+    if (finished) return;
+    finished = true;
+    jumpscareVideo.pause();
+    jumpscareEl.style.display = 'none';
+    resetToStart();
+  };
   jumpscareVideo.play().then(() => { usedVideo = true; }).catch(() => {});
   jumpscareVideo.onended = toReset;
+  jumpscareVideo.onerror = () => { if (!usedVideo) { usedVideo = false; } };
   setTimeout(() => {
-    if (!usedVideo) {
+    if (!usedVideo && !finished) {
+      jumpscareVideo.onended = null;
+      jumpscareVideo.pause();
       jumpscareVideo.style.display = 'none';
       jumpscareFallback.style.display = 'block';
       setTimeout(toReset, 900);
@@ -510,6 +529,7 @@ function playJumpscareThenReset() {
 function resetToStart() {
   wantListening = false;
   if (recognition) { try { recognition.stop(); } catch (_) {} }
+  clearTimeout(dementorTimer);                    // a pending re-schedule must not fire on the start screen
   dementorState = 'idle';
   dementorEl.style.opacity = '0';
   trail = []; particles.clear();
@@ -529,8 +549,8 @@ document.getElementById('start-btn').addEventListener('click', async () => {
   startSpeech();
   scheduleDementor();
   try {
-    await initHandTracking();
-    loop();
+    if (!handLandmarker) await initHandTracking();
+    if (!loopStarted) { loopStarted = true; loop(); }
   } catch (e) {
     console.error(e);
     setStatus('st-hands', 'bad', `Hand tracking failed: ${e.message}`);
